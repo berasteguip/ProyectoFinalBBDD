@@ -11,6 +11,11 @@ MONGO_PORT = 27017
 MONGO_DB   = "ProyectoBBDD"
 MONGO_COLLECTION = "ReviewsText"
 
+# Parámetros Neo4J (se pueden definir en configuracion.py)
+NEO4J_URI = "bolt://localhost:7687"  # URI de conexión a Neo4J
+NEO4J_USER = "neo4j"                # Usuario de Neo4J
+NEO4J_PASS = "password"             # Contraseña de Neo4J
+
 # Rutas de los ficheros JSON
 TOYS_FILE       = "data/Toys_and_Games_5.json"
 VIDEOGAMES_FILE = "data/Video_Games_5.json"
