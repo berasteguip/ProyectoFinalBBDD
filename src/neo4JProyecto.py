@@ -6,10 +6,6 @@ import pymysql
 import math
 import configuracion  # Archivo de configuración con credenciales y parámetros
 
-# Parámetros Neo4J (se pueden definir en configuracion.py)
-NEO4J_URI = configuracion.NEO4J_URI       # ej: "bolt://localhost:7687"
-NEO4J_USER = configuracion.NEO4J_USER     # ej: "neo4j"
-NEO4J_PASS = configuracion.NEO4J_PASS     # ej: "password"
 
 # Parámetros MySQL (para extraer datos de reviews)
 def connect_mysql():
@@ -117,4 +113,175 @@ def load_user_article_relationships(driver, article_type, num_articles, connecti
     # Seleccionar aleatoriamente 'num_articles' artículos del tipo indicado.
     with connection.cursor() as cursor:
         sql = "SELECT p.product_id, p.asin FROM Products p WHERE p.category = %s ORDER BY RAND() LIMIT %s"
-        cursor.execute(sql,
+        cursor.execute(sql, (article_type, num_articles))
+        articles = cursor.fetchall()
+    
+    # Para cada artículo, obtener los usuarios que lo han revisado.
+    with connection.cursor() as cursor:
+        for article in articles:
+            sql = "SELECT DISTINCT r.user_id, r.overall, r.review_date FROM Reviews r WHERE r.product_id = %s"
+            cursor.execute(sql, (article["product_id"],))
+            reviews = cursor.fetchall()
+            # Crear nodo del artículo y relaciones con los usuarios.
+            with driver.session() as session:
+                session.run(
+                    """
+                    MERGE (a:Article {asin: $asin, category: $category})
+                    """,
+                    asin=article["asin"], category=article_type
+                )
+                for review in reviews:
+                    session.run(
+                        """
+                        MATCH (u:User {user_id: $user_id}), (a:Article {asin: $asin})
+                        MERGE (u)-[r:REVIEWED]->(a)
+                        SET r.overall = $overall, r.review_date = $review_date
+                        """,
+                        user_id=review["user_id"],
+                        asin=article["asin"],
+                        overall=review["overall"],
+                        review_date=str(review["review_date"])
+                    )
+    print("Neo4J: Enlaces entre usuarios y artículos cargados.")
+
+# Función para cargar usuarios que han revisado artículos de distintos tipos.
+def load_users_multiple_categories(driver, connection):
+    # Seleccionar los primeros 400 usuarios ordenados alfabéticamente por reviewerID
+    with connection.cursor() as cursor:
+        sql = "SELECT u.user_id, u.reviewerID FROM Users u ORDER BY u.reviewerID LIMIT 400"
+        cursor.execute(sql)
+        users = cursor.fetchall()
+    
+    # Para cada usuario, obtener las categorías de los artículos que han revisado.
+    user_categories = {}
+    with connection.cursor() as cursor:
+        for user in users:
+            sql = """
+                SELECT DISTINCT p.category FROM Reviews r
+                JOIN Products p ON r.product_id = p.product_id
+                WHERE r.user_id = %s
+            """
+            cursor.execute(sql, (user["user_id"],))
+            cats = [row["category"] for row in cursor.fetchall()]
+            if len(cats) > 1:
+                user_categories[user["user_id"]] = cats
+    
+    # Cargar en Neo4J nodos para usuarios y para cada categoría revisada, creando relaciones
+    with driver.session() as session:
+        for user_id, categories in user_categories.items():
+            # Aseguramos que el nodo del usuario existe:
+            session.run("MERGE (u:User {user_id: $user_id})", user_id=user_id)
+            for cat in categories:
+                session.run(
+                    """
+                    MERGE (c:Category {name: $cat})
+                    WITH c
+                    MATCH (u:User {user_id: $user_id})
+                    MERGE (u)-[:REVIEWED_CATEGORY {count: 1}]->(c)
+                    ON CREATE SET u.categories = [$cat]
+                    ON MATCH SET u.categories = coalesce(u.categories, []) + $cat
+                    """,
+                    cat=cat, user_id=user_id
+                )
+    print("Neo4J: Usuarios con múltiples categorías cargados.")
+
+# Función para cargar los 5 artículos populares con menos de 40 reviews y enlazar usuarios
+def load_popular_articles(driver, connection):
+    with connection.cursor() as cursor:
+        # Seleccionar 5 artículos con menos de 40 reviews ordenados por número de reviews (descendente)
+        sql = """
+            SELECT p.product_id, p.asin, COUNT(r.review_id) as review_count
+            FROM Products p
+            JOIN Reviews r ON p.product_id = r.product_id
+            GROUP BY p.product_id
+            HAVING review_count < 40
+            ORDER BY review_count DESC
+            LIMIT 5
+        """
+        cursor.execute(sql)
+        articles = cursor.fetchall()
+    
+    with driver.session() as session:
+        for article in articles:
+            # Crear nodo para el artículo
+            session.run(
+                "MERGE (a:Article {asin: $asin}) SET a.review_count = $count",
+                asin=article["asin"], count=article["review_count"]
+            )
+            # Obtener usuarios que han revisado el artículo
+            with connection.cursor() as cursor2:
+                sql = "SELECT DISTINCT user_id FROM Reviews WHERE product_id = %s"
+                cursor2.execute(sql, (article["product_id"],))
+                users = [row["user_id"] for row in cursor2.fetchall()]
+            # Crear relaciones de revisión entre esos usuarios y el artículo
+            for user_id in users:
+                session.run(
+                    """
+                    MATCH (u:User {user_id: $user_id}), (a:Article {asin: $asin})
+                    MERGE (u)-[:REVIEWED_ARTICLE]->(a)
+                    """,
+                    user_id=user_id, asin=article["asin"]
+                )
+            # Además, crear relaciones entre usuarios basadas en número de artículos en común
+            for i in range(len(users)):
+                for j in range(i+1, len(users)):
+                    session.run(
+                        """
+                        MATCH (u1:User {user_id: $u1}), (u2:User {user_id: $u2})
+                        MERGE (u1)-[r:COMMON_REVIEWS]-(u2)
+                        ON CREATE SET r.count = 1
+                        ON MATCH SET r.count = r.count + 1
+                        """,
+                        u1=users[i], u2=users[j]
+                    )
+    print("Neo4J: Artículos populares y relaciones entre usuarios creados.")
+
+# Menú principal para la aplicación Neo4J
+def main_menu():
+    # Conexión a Neo4J
+    driver = GraphDatabase.driver(configuracion.NEO4J_URI, auth=(configuracion.NEO4J_USER, configuracion.NEO4J_PASS))
+    # Conexión a MySQL para extraer información
+    mysql_conn = connect_mysql()
+    
+    # Limpieza inicial del grafo (si se desea)
+    clear_neo4j_graph(driver)
+    
+    while True:
+        print("\nMenú Neo4J Proyecto Bases de Datos")
+        print("1. Cargar similitudes entre usuarios en Neo4J")
+        print("2. Cargar enlaces entre usuarios y artículos")
+        print("3. Cargar usuarios que han revisado artículos de múltiples categorías")
+        print("4. Cargar 5 artículos populares (menos de 40 reviews) y relaciones entre usuarios")
+        print("5. Salir")
+        opcion = input("Seleccione una opción: ")
+        
+        if opcion == "1":
+            # Obtener top 30 usuarios
+            with mysql_conn.cursor() as cursor:
+                top_users = get_top_users(30, mysql_conn)
+            similarities = compute_similarity_matrix(top_users, mysql_conn)
+            create_users_nodes(driver, top_users)
+            create_similarity_relationships(driver, similarities)
+            print("Funcionalidad 1 completada.")
+        elif opcion == "2":
+            article_type = input("Ingrese el tipo de artículo (ej. Video_Games, Toys_and_Games, etc.): ")
+            num_articles = int(input("Número de artículos a seleccionar aleatoriamente: "))
+            load_user_article_relationships(driver, article_type, num_articles, mysql_conn)
+            print("Funcionalidad 2 completada.")
+        elif opcion == "3":
+            load_users_multiple_categories(driver, mysql_conn)
+            print("Funcionalidad 3 completada.")
+        elif opcion == "4":
+            load_popular_articles(driver, mysql_conn)
+            print("Funcionalidad 4 completada.")
+        elif opcion == "5":
+            print("Saliendo...")
+            break
+        else:
+            print("Opción no válida. Intente de nuevo.")
+    
+    mysql_conn.close()
+    driver.close()
+
+if __name__ == "__main__":
+    main_menu()
